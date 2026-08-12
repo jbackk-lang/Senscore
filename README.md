@@ -1,139 +1,69 @@
-# Senscore
-warstwa korelacji z czułością / charakterystyką czujników
-SENSCORE Pipeline — README
-Opis projektu
-senscoreAll.py implementuje kompletny pipeline filtracji sygnałów z detektorów, oparty na pięciu warstwach:
+# Senscore — przegląd kodu i testy
 
-SENSCORE — filtr czułości czujników
+Przegląd repozytorium [jbackk-lang/Senscore](https://github.com/jbackk-lang/Senscore): pipeline filtracji sygnałów z detektorów (`senscoreAll.py`), oparty na pięciu warstwach — SENSCORE, TRM, TIMDR, GIA, FIELDCORE.
 
-TRM — filtr topologiczny
+## Znaleziony błąd
 
-TIMDR — filtr dynamiki
+**`GIAFilter` odrzucał prawdziwy tor, a zachowywał szum.**
 
-GIA — filtr fizyczno‑semantyczny
+Filtr liczył oś toru zwykłym PCA na wszystkich hitach naraz. Zwykłe PCA nie jest odporne na odstające punkty — jeden hit daleko od toru potrafi zdominować wariancję i obrócić główną oś PCA w swoim kierunku.
 
-FIELDCORE — filtr stabilizujący
+Przykład testowy: linia 10 hitów wzdłuż osi X + jeden odstający punkt `(5, 50, 0)`.
 
-Pipeline został zaprojektowany do redukcji fałszywych sygnałów (false positives) w danych z detektorów cząstek, czujników przemysłowych lub systemów pomiarowych o wysokiej gęstości sygnałów.
+| Wersja | Zachowane hity | Wynik |
+|---|---|---|
+| Przed poprawką | 3 (2 hity blisko środka toru + sam szum) | 7 poprawnych hitów z końców toru odrzuconych, szum zachowany |
+| Po poprawce | 10 (cały tor) | szum poprawnie odrzucony |
 
-Struktura pliku
-Plik senscoreAll.py zawiera:
+**Poprawka:** oś toru jest teraz szacowana metodą zbliżoną do RANSAC — losowane są pary punktów jako kandydackie proste, wybierany kandydat z największą liczbą „inlierów” w zasięgu `max_residual`, a finalna oś dopasowywana PCA tylko do tych inlierów. Dodatkowo `np.linalg.eig` zamieniono na `np.linalg.eigh` (macierz kowariancji jest symetryczna, więc `eigh` jest szybsze i zawsze zwraca wartości rzeczywiste).
 
-definicje struktur danych (Hit, Event, SensorCalibration),
+Przykład z README repozytorium działa bez zmian po poprawce.
 
-implementacje pięciu filtrów,
+## Uwaga (nie błąd, ale warto wiedzieć)
 
-klasę FullPipeline, która łączy wszystkie filtry w jedną sekwencję,
+Domyślny próg `FIELDCOREFilter` (10 sigma) jest znacznie luźniejszy niż próg `TIMDRFilter` (3 sigma), który działa wcześniej w pipeline. W efekcie `FIELDCOREFilter` przy domyślnej konfiguracji praktycznie nigdy nic nie usuwa — wszystko, co wystarczająco odstaje, zostało już odrzucone przez TIMDR. Udokumentowane testem `test_default_threshold_rarely_triggers`.
 
-przykładowy kod uruchomieniowy.
+## Wyniki testów
 
-Pipeline filtracji
-1. SENSCORE — filtr czułości czujników
-Warstwa wejściowa.
-Skalibrowane wagi sygnałów na podstawie:
+26 testów, `python3 -m pytest test_senscoreAll.py -v` — **26 passed**.
 
-czułości kanału,
+| # | Warstwa | Test | Co sprawdza | Wynik |
+|---|---|---|---|---|
+| 1 | SENSCORE | `test_weight_formula` | poprawność wzoru wagi (czułość × wiarygodność / (1 + szum)) | ✅ PASSED |
+| 2 | SENSCORE | `test_missing_calibration_defaults_to_weight_one` | brak kalibracji → waga domyślna 1.0 | ✅ PASSED |
+| 3 | SENSCORE | `test_empty_event` | pusty event nie wywołuje błędu | ✅ PASSED |
+| 4 | SENSCORE | `test_zero_reliability_zeroes_signal` | zerowa wiarygodność zeruje sygnał | ✅ PASSED |
+| 5 | TRM | `test_isolated_hit_removed` | odległe, izolowane hity są odrzucane | ✅ PASSED |
+| 6 | TRM | `test_clustered_hits_kept` | hity blisko siebie w czasie/przestrzeni są zachowane | ✅ PASSED |
+| 7 | TRM | `test_single_hit_always_dropped` | pojedynczy hit w evencie zawsze traktowany jako szum | ✅ PASSED |
+| 8 | TRM | `test_empty_event` | pusty event nie wywołuje błędu | ✅ PASSED |
+| 9 | TIMDR | `test_energy_outlier_removed` | skrajny outlier energetyczny jest odrzucany | ✅ PASSED |
+| 10 | TIMDR | `test_time_tails_trimmed_when_span_too_large` | zbyt rozciągnięte w czasie zdarzenie jest przycinane do środkowych 80% | ✅ PASSED |
+| 11 | TIMDR | `test_time_not_trimmed_when_span_small` | krótkie zdarzenie nie jest przycinane | ✅ PASSED |
+| 12 | TIMDR | `test_empty_event` | pusty event nie wywołuje błędu | ✅ PASSED |
+| 13 | TIMDR | `test_constant_energy_no_div_by_zero` | stała energia (std=0) nie powoduje dzielenia przez zero | ✅ PASSED |
+| 14 | GIA | `test_fewer_than_three_hits_passthrough` | poniżej 3 hitów filtr nic nie robi | ✅ PASSED |
+| 15 | GIA | `test_linear_track_kept` | idealnie liniowy tor jest w całości zachowany | ✅ PASSED |
+| 16 | GIA | `test_off_axis_point_removed` | **regresja dla naprawionego błędu** — tor zachowany, szum odrzucony | ✅ PASSED |
+| 17 | GIA | `test_identical_points_no_crash` | identyczne punkty (macierz kowariancji zerowa) nie wywołują błędu | ✅ PASSED |
+| 18 | GIA | `test_residuals_are_real_not_complex` | 200 losowych konfiguracji — brak wyjątków, wyniki liczbowe poprawne | ✅ PASSED |
+| 19 | GIA | `test_empty_event` | pusty event nie wywołuje błędu | ✅ PASSED |
+| 20 | FIELDCORE | `test_default_threshold_rarely_triggers` | dokumentuje: domyślny próg (10σ) praktycznie nic nie usuwa | ✅ PASSED |
+| 21 | FIELDCORE | `test_explicit_low_threshold_removes_hot_pixel` | niższy próg poprawnie usuwa „gorący piksel” | ✅ PASSED |
+| 22 | FIELDCORE | `test_empty_event` | pusty event nie wywołuje błędu | ✅ PASSED |
+| 23 | Pipeline | `test_readme_example_runs` | przykład z README repozytorium działa bez błędów | ✅ PASSED |
+| 24 | Pipeline | `test_empty_event_through_pipeline` | pusty event przechodzi przez cały pipeline bez błędu | ✅ PASSED |
+| 25 | Pipeline | `test_single_hit_event_ends_up_empty` | pojedynczy hit kończy jako pusty event (efekt TRM) | ✅ PASSED |
+| 26 | Pipeline | `test_large_random_event_no_crash` | 200 losowych hitów, 5 czujników — cały pipeline bez błędów, brak NaN | ✅ PASSED |
 
-poziomu szumu własnego,
+## Pliki
 
-wiarygodności czujnika.
+- `senscoreAll.py` — kod źródłowy z poprawką w `GIAFilter`
+- `test_senscoreAll.py` — zestaw 26 testów (`pytest`)
 
-Cel:  
-odrzucić lub osłabić sygnały z kanałów o niskiej jakości zanim trafią do dalszej analizy.
+## Uruchomienie testów
 
-2. TRM — filtr topologiczny
-Buduje lokalną topologię zdarzenia:
-
-analizuje sąsiedztwo przestrzenne i czasowe,
-
-odrzuca izolowane hity,
-
-zachowuje struktury spójne.
-
-Cel:  
-usunąć szum, który nie tworzy żadnej fizycznej lub geometrycznej struktury.
-
-3. TIMDR — filtr dynamiki
-Analiza dynamiki sygnału:
-
-spójność energetyczna,
-
-spójność czasowa,
-
-odrzucanie outlierów.
-
-Cel:  
-wyłapać sygnały niezgodne z globalną dynamiką zdarzenia.
-
-4. GIA — filtr fizyczno‑semantyczny
-Analiza zgodności z modelem fizycznym:
-
-dopasowanie toru (PCA),
-
-odrzucanie punktów o dużej resztowej odległości od osi toru.
-
-Cel:  
-zachować tylko sygnały zgodne z fizyką zdarzenia.
-
-5. FIELDCORE — filtr stabilizujący
-Końcowa stabilizacja:
-
-wygładzanie energii,
-
-usuwanie „gorących pikseli”,
-
-finalne czyszczenie.
-
-Cel:  
-uzyskać stabilny, oczyszczony zestaw hitów.
-
-Uruchomienie
-Minimalny przykład:
-
-python
-from senscoreAll import FullPipeline, Event, Hit, SensorCalibration
-
-calibration = {
-    1: SensorCalibration(1, sensitivity=1.0, noise_level=0.1, reliability=0.9),
-    2: SensorCalibration(2, sensitivity=0.8, noise_level=0.5, reliability=0.7),
-}
-
-hits = [
-    Hit(sensor_id=1, x=0, y=0, z=0, t=0, energy=10, raw_value=1),
-    Hit(sensor_id=1, x=1, y=0.1, z=0, t=1, energy=11, raw_value=1.1),
-    Hit(sensor_id=2, x=50, y=50, z=0, t=0.5, energy=0.5, raw_value=0.2),
-]
-
-event = Event(hits=hits)
-pipeline = FullPipeline(calibration_map=calibration)
-
-filtered = pipeline.process(event)
-print(filtered)
-Zastosowania
-detektory cząstek (CERN‑style),
-
-systemy sensorów przemysłowych,
-
-systemy pomiarowe o dużej gęstości sygnałów,
-
-filtrowanie danych z kamer ToF / LiDAR,
-
-analiza sygnałów w systemach robotycznych.
-
-Cele projektu
-redukcja fałszywych sygnałów o 40–50%,
-
-stabilizacja danych wejściowych,
-
-modularna architektura filtrów,
-
-możliwość podmiany filtrów na wersje ML/GNN.
-
-Plan rozwoju
-dodanie wersji GNN dla TRM i GIA,
-
-dodanie dynamicznej kalibracji SENSCORE,
-
-integracja z realnymi danymi z detektorów,
-
-wersja GPU.
+```bash
+pip install pytest numpy
+python3 -m pytest test_senscoreAll.py -v
+```
