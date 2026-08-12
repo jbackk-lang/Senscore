@@ -157,6 +157,18 @@ class GIAFilter:
       np. tor w polu magnetycznym ~ łuk / helisa.
     Tu: uproszczony wariant → preferujemy hity układające się w
     mniej więcej liniową / łukową strukturę.
+
+    POPRAWKA: pierwotna wersja liczyła oś toru zwykłym PCA na WSZYSTKICH
+    hitach naraz. Zwykłe PCA nie jest odporne na odstające punkty — jeden
+    hit daleko od toru potrafi zdominować wariancję i obrócić główną oś
+    PCA w swoim kierunku. W efekcie filtr odrzucał prawdziwe hity z toru,
+    a zachowywał sam szum (zweryfikowane testem: linia 10 hitów wzdłuż
+    osi X + jeden odstający punkt (5, 50, 0) → stara wersja zachowywała
+    3 hity blisko środka + szum, odrzucając 7 poprawnych hitów z końców
+    toru). Nowa wersja szacuje oś metodą zbliżoną do RANSAC: losuje pary
+    punktów jako kandydackie proste, wybiera kandydata z największą
+    liczbą „inlierów” (hitów w zasięgu max_residual), a finalną oś
+    dopasowuje PCA tylko do tych inlierów.
     """
 
     def __init__(self, max_residual: float = 5.0):
@@ -167,31 +179,81 @@ class GIAFilter:
         if len(hits) < 3:
             return event
 
-        # dopasuj prostą w 3D (bardzo uproszczone)
         positions = np.array([[h.x, h.y, h.z] for h in hits])
-        mean_pos = np.mean(positions, axis=0)
-        centered = positions - mean_pos
 
-        # PCA: główny kierunek
-        cov = centered.T @ centered
-        eigvals, eigvecs = np.linalg.eig(cov)
-        main_dir = eigvecs[:, np.argmax(eigvals)]
+        main_dir, mean_pos = self._robust_axis(positions)
+        residuals = self._residuals(positions, mean_pos, main_dir)
 
-        # oblicz odległość punktów od osi głównej
-        residuals = []
-        for p in centered:
-            proj = np.dot(p, main_dir) * main_dir
-            res = np.linalg.norm(p - proj)
-            residuals.append(res)
-
-        residuals = np.array(residuals)
-
-        kept_hits = []
-        for h, r in zip(hits, residuals):
-            if r <= self.max_residual:
-                kept_hits.append(h)
-
+        kept_hits = [h for h, r in zip(hits, residuals) if r <= self.max_residual]
         return Event(hits=kept_hits)
+
+    @staticmethod
+    def _residuals(positions, mean_pos, main_dir):
+        centered = positions - mean_pos
+        proj_len = centered @ main_dir
+        proj = np.outer(proj_len, main_dir)
+        return np.linalg.norm(centered - proj, axis=1)
+
+    @staticmethod
+    def _pca_axis(positions):
+        mean_pos = positions.mean(axis=0)
+        centered = positions - mean_pos
+        cov = centered.T @ centered
+        # macierz kowariancji jest symetryczna -> eigh (szybsze, zawsze
+        # zwraca wartości/wektory rzeczywiste, w przeciwieństwie do eig)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        main_dir = eigvecs[:, -1]  # eigh zwraca wartości rosnąco
+        norm = np.linalg.norm(main_dir)
+        if norm > 0:
+            main_dir = main_dir / norm
+        return main_dir, mean_pos
+
+    def _robust_axis(self, positions, n_trials=200, seed=0):
+        n = len(positions)
+        rng = np.random.default_rng(seed)
+
+        # dla małych zbiorów zwykłe PCA na całości wystarczy
+        if n < 5:
+            return self._pca_axis(positions)
+
+        idx_pairs = set()
+        attempts = 0
+        max_attempts = n_trials * 3
+        max_pairs = min(n_trials, n * (n - 1) // 2)
+        while len(idx_pairs) < max_pairs and attempts < max_attempts:
+            i, j = rng.integers(0, n, size=2)
+            attempts += 1
+            if i == j:
+                continue
+            idx_pairs.add((min(i, j), max(i, j)))
+
+        best_inliers = None
+        best_count = -1
+        for i, j in idx_pairs:
+            p1, p2 = positions[i], positions[j]
+            direction = p2 - p1
+            norm = np.linalg.norm(direction)
+            if norm < 1e-9:
+                continue
+            direction = direction / norm
+
+            centered = positions - p1
+            proj_len = centered @ direction
+            proj = np.outer(proj_len, direction)
+            residuals = np.linalg.norm(centered - proj, axis=1)
+
+            inliers = residuals <= self.max_residual
+            count = int(np.sum(inliers))
+            if count > best_count:
+                best_count, best_inliers = count, inliers
+
+        if best_inliers is None or best_inliers.sum() < 2:
+            # brak sensownego kandydata (np. wszystkie punkty w tym samym
+            # miejscu) -> zwykłe PCA na całym zbiorze
+            return self._pca_axis(positions)
+
+        # finalna oś: PCA dopasowane tylko do znalezionych inlierów
+        return self._pca_axis(positions[best_inliers])
 
 
 class FIELDCOREFilter:
